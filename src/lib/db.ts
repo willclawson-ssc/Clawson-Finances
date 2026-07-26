@@ -64,9 +64,22 @@ export interface LedgerRow {
   category_name: string | null;
 }
 
+/**
+ * ⚠️ `txn_date::text` is REQUIRED, not cosmetic. The driver decodes a bare `date` column
+ * into a JS Date object, and page.tsx renders the field directly — React then throws
+ * "Objects are not valid as a React child" and the whole route fails to render, which
+ * looks to the user like a broken login.
+ *
+ * The empty ledger hid this: with no rows the page took its empty-state branch and never
+ * touched the field, so it only surfaced the moment real data landed. accountSummaries()
+ * already casts for the same reason.
+ *
+ * TypeScript will NOT catch a regression here — `LedgerRow.txn_date` is declared string,
+ * and a tagged-template query is opaque to the compiler. Keep the cast.
+ */
 export async function recentTransactions(limit = 100): Promise<LedgerRow[]> {
   return (await sql`
-    SELECT t.id, t.txn_date, t.normalized_merchant, t.raw_description,
+    SELECT t.id, t.txn_date::text AS txn_date, t.normalized_merchant, t.raw_description,
            t.amount, t.status, t.source,
            a.name AS account_name, c.name AS category_name
     FROM transactions t
