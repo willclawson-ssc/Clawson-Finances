@@ -1,65 +1,150 @@
-import Image from "next/image";
+import { auth } from "@clerk/nextjs/server";
+import { SignInButton, UserButton } from "@clerk/nextjs";
+import { accountSummaries, recentTransactions, listAccounts } from "@/lib/db";
+import { ImportPanel } from "./import-panel";
 
-export default function Home() {
+export const dynamic = "force-dynamic";
+
+const money = (v: string | number | null) => {
+  const n = Number(v ?? 0);
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
+};
+
+export default async function Home() {
+  const { userId } = await auth();
+
+  if (!userId) {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center gap-6 p-8">
+        <h1 className="text-2xl font-semibold">Clawson Finances</h1>
+        <p className="text-sm text-gray-500">Sign-in is restricted to invited accounts.</p>
+        <SignInButton>
+          <button className="rounded bg-black px-5 py-2.5 text-sm font-medium text-white">
+            Sign in
+          </button>
+        </SignInButton>
+      </main>
+    );
+  }
+
+  const [summaries, txns, accounts] = await Promise.all([
+    accountSummaries(),
+    recentTransactions(100),
+    listAccounts(),
+  ]);
+
+  const net = summaries.reduce((a, s) => a + Number(s.balance ?? 0), 0);
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+    <main className="mx-auto max-w-6xl p-6">
+      <header className="mb-8 flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold">Clawson Finances</h1>
+          <p className="text-sm text-gray-500">
+            {summaries.reduce((a, s) => a + s.txn_count, 0).toLocaleString()} transactions
+            {" · net change "}
+            {money(net)}
+          </p>
+          {/*
+            Deliberately "net change", never "spent". On a liability account this sum is
+            the balance change: card payments come in as inflows and largely cancel the
+            purchases (the real USAA card export nets +$1,598 over 18 months). A true
+            spend figure requires transfer detection, which isn't built yet — so labelling
+            this "spent" would be actively wrong.
+          */}
+          <p className="mt-1 text-xs text-amber-700">
+            Transfers between accounts aren&apos;t detected yet, so card payments still count
+            here. This is not a spending total.
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+        <UserButton />
+      </header>
+
+      <section className="mb-8">
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">
+          Accounts
+        </h2>
+        {summaries.length === 0 ? (
+          <p className="rounded border border-dashed p-6 text-sm text-gray-500">
+            No accounts yet. Add one below before importing a statement.
+          </p>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {summaries.map((s) => (
+              <div key={s.id} className="rounded-lg border p-4">
+                <div className="flex items-baseline justify-between">
+                  <span className="font-medium">{s.name}</span>
+                  <span className="text-xs uppercase text-gray-400">{s.type}</span>
+                </div>
+                <div className="mt-1 text-xl tabular-nums">{money(s.balance)}</div>
+                <div className="mt-1 text-xs text-gray-500">
+                  {s.txn_count.toLocaleString()} txns
+                  {/* Staleness is stated outright rather than implied. */}
+                  {s.reconciled_through
+                    ? ` · reconciled through ${s.reconciled_through}`
+                    : " · nothing imported yet"}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <ImportPanel accounts={accounts} />
+
+      <section className="mt-10">
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">
+          Recent transactions
+        </h2>
+        {txns.length === 0 ? (
+          <p className="rounded border border-dashed p-6 text-sm text-gray-500">
+            Nothing imported yet.
+          </p>
+        ) : (
+          <div className="overflow-x-auto rounded-lg border">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
+                <tr>
+                  <th className="p-2.5">Date</th>
+                  <th className="p-2.5">Merchant</th>
+                  <th className="p-2.5">Account</th>
+                  <th className="p-2.5">Category</th>
+                  <th className="p-2.5 text-right">Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                {txns.map((t) => (
+                  <tr key={t.id} className="border-t">
+                    <td className="whitespace-nowrap p-2.5 tabular-nums text-gray-600">
+                      {t.txn_date}
+                    </td>
+                    <td className="p-2.5">
+                      {/* Hover reveals the raw descriptor the normalized name came from. */}
+                      <span title={t.raw_description}>{t.normalized_merchant}</span>
+                      {t.status !== "posted" && (
+                        <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800">
+                          {t.status}
+                        </span>
+                      )}
+                    </td>
+                    <td className="p-2.5 text-gray-600">{t.account_name}</td>
+                    <td className="p-2.5 text-gray-500">
+                      {t.category_name ?? <span className="text-gray-300">uncategorized</span>}
+                    </td>
+                    <td
+                      className={`p-2.5 text-right tabular-nums ${
+                        Number(t.amount) < 0 ? "" : "text-green-700"
+                      }`}
+                    >
+                      {money(t.amount)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    </main>
   );
 }
