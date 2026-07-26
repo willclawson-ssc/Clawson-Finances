@@ -2,7 +2,10 @@ import { auth } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
 import Papa from "papaparse";
 import { sql } from "@/lib/db";
-import { detectAdapter, parseRows, type AccountType, type AdapterId } from "@/lib/adapters";
+import {
+  detectAdapter, parseRows, accountTypeWarning, type AccountType, type AdapterId,
+} from "@/lib/adapters";
+import { matchSettlements, type ExistingPending } from "@/lib/reconcile";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -44,6 +47,19 @@ export async function POST(req: Request) {
   }
 
   const dates = rows.map((r) => r.txnDate).sort();
+  const warning = accountTypeWarning(rows, account.name);
+
+  // Settle anything still pending from a previous import BEFORE inserting. A restaurant
+  // authorization re-exports as Posted at a different amount once the tip lands, which is
+  // a different fingerprint — so without this step the meal is inserted a second time and
+  // the stale pending row never goes away. See src/lib/reconcile.ts.
+  const pending = (await sql`
+    SELECT id, txn_date::text AS txn_date, raw_description, normalized_merchant,
+           amount::text AS amount, status::text AS status
+    FROM transactions
+    WHERE account_id = ${accountId}::uuid AND status <> 'posted'
+  `) as ExistingPending[];
+  const { settlements, fresh } = matchSettlements(rows, pending);
 
   const importRows = (await sql`
     INSERT INTO statement_imports (account_id, adapter, filename, row_count, range_start, range_end)
@@ -53,27 +69,50 @@ export async function POST(req: Request) {
   `) as { id: string }[];
   const importId = importRows[0].id;
 
+  // Apply settlements in place. The fingerprint is a generated column, so updating the
+  // amount/date recomputes it — which can collide with a posted row already present if
+  // the same statement is imported twice. In that case the pending row is simply
+  // superseded and gets deleted rather than left as a phantom charge.
+  let settled = 0;
+  for (const s of settlements) {
+    try {
+      await sql`
+        UPDATE transactions
+        SET txn_date = ${s.row.txnDate}::date, post_date = ${s.row.postDate}::date,
+            raw_description = ${s.row.rawDescription},
+            normalized_merchant = ${s.row.normalizedMerchant},
+            amount = ${s.row.amount}, status = 'posted'::txn_status,
+            bank_category = ${s.row.bankCategory}, statement_import_id = ${importId}::uuid
+        WHERE id = ${s.pendingId}::uuid
+      `;
+    } catch (e) {
+      if (!String(e).includes("transactions_fingerprint_csv_key")) throw e;
+      await sql`DELETE FROM transactions WHERE id = ${s.pendingId}::uuid`;
+    }
+    settled++;
+  }
+
   // Idempotent re-import. ON CONFLICT targets the PARTIAL unique index on fingerprint
   // (source = 'csv'), so re-uploading an overlapping date range inserts nothing new,
   // while genuine same-day same-amount repeats still land because the fingerprint
   // includes an occurrence ordinal.
   let inserted = 0;
   const CHUNK = 500;
-  for (let i = 0; i < rows.length; i += CHUNK) {
-    const chunk = rows.slice(i, i + CHUNK);
+  for (let i = 0; i < fresh.length; i += CHUNK) {
+    const chunk = fresh.slice(i, i + CHUNK);
     const result = (await sql.query(
       `INSERT INTO transactions
          (account_id, txn_date, post_date, raw_description, normalized_merchant,
-          amount, status, source, bank_category, purchased_by, occurrence_n,
+          amount, status, source, bank_category, purchased_by, txn_type, occurrence_n,
           statement_import_id)
        SELECT $1::uuid, d.txn_date, d.post_date, d.raw_description, d.normalized_merchant,
               d.amount, d.status::txn_status, 'csv'::txn_source, d.bank_category,
-              d.purchased_by, d.occurrence_n, $2::uuid
+              d.purchased_by, d.txn_type, d.occurrence_n, $2::uuid
        FROM unnest(
               $3::date[], $4::date[], $5::text[], $6::text[], $7::numeric[],
-              $8::text[], $9::text[], $10::text[], $11::smallint[]
+              $8::text[], $9::text[], $10::text[], $11::text[], $12::smallint[]
             ) AS d(txn_date, post_date, raw_description, normalized_merchant, amount,
-                   status, bank_category, purchased_by, occurrence_n)
+                   status, bank_category, purchased_by, txn_type, occurrence_n)
        ON CONFLICT (fingerprint) WHERE source = 'csv' DO NOTHING
        RETURNING 1`,
       [
@@ -87,16 +126,18 @@ export async function POST(req: Request) {
         chunk.map((r) => r.status),
         chunk.map((r) => r.bankCategory),
         chunk.map((r) => r.purchasedBy),
+        chunk.map((r) => r.txnType),
         chunk.map((r) => r.occurrenceN),
       ],
     )) as unknown[];
     inserted += Array.isArray(result) ? result.length : 0;
   }
 
-  const duplicates = rows.length - inserted;
+  const duplicates = fresh.length - inserted;
   await sql`
     UPDATE statement_imports
-    SET inserted_count = ${inserted}, skipped_count = ${duplicates + skipped.length}
+    SET inserted_count = ${inserted}, updated_count = ${settled},
+        skipped_count = ${duplicates + skipped.length}
     WHERE id = ${importId}::uuid
   `;
 
@@ -104,6 +145,8 @@ export async function POST(req: Request) {
     adapter,
     account: account.name,
     parsed: rows.length,
+    settled,
+    warning,
     inserted,
     duplicates,
     unparseable: skipped.length,

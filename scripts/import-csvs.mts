@@ -60,22 +60,23 @@ for (const { file, account } of FILES) {
     const res = (await sql.query(
       `INSERT INTO transactions
          (account_id, txn_date, post_date, raw_description, normalized_merchant,
-          amount, status, source, bank_category, purchased_by, occurrence_n,
+          amount, status, source, bank_category, purchased_by, txn_type, occurrence_n,
           statement_import_id)
        SELECT $1::uuid, d.txn_date, d.post_date, d.raw_description, d.normalized_merchant,
               d.amount, d.status::txn_status, 'csv'::txn_source, d.bank_category,
-              d.purchased_by, d.occurrence_n, $2::uuid
+              d.purchased_by, d.txn_type, d.occurrence_n, $2::uuid
        FROM unnest($3::date[], $4::date[], $5::text[], $6::text[], $7::numeric[],
-                   $8::text[], $9::text[], $10::text[], $11::smallint[])
+                   $8::text[], $9::text[], $10::text[], $11::text[], $12::smallint[])
             AS d(txn_date, post_date, raw_description, normalized_merchant, amount,
-                 status, bank_category, purchased_by, occurrence_n)
+                 status, bank_category, purchased_by, txn_type, occurrence_n)
        ON CONFLICT (fingerprint) WHERE source = 'csv' DO NOTHING
        RETURNING 1`,
       [
         acct.id, imp[0].id,
         c.map((r) => r.txnDate), c.map((r) => r.postDate), c.map((r) => r.rawDescription),
         c.map((r) => r.normalizedMerchant), c.map((r) => r.amount), c.map((r) => r.status),
-        c.map((r) => r.bankCategory), c.map((r) => r.purchasedBy), c.map((r) => r.occurrenceN),
+        c.map((r) => r.bankCategory), c.map((r) => r.purchasedBy), c.map((r) => r.txnType),
+        c.map((r) => r.occurrenceN),
       ],
     )) as unknown[];
     inserted += Array.isArray(res) ? res.length : 0;

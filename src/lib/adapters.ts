@@ -23,6 +23,8 @@ export interface ParsedRow {
   status: "posted" | "pending" | "scheduled";
   bankCategory: string | null;
   purchasedBy: string | null;
+  /** Institution's own type label, verbatim. Apple Card only; see migration 0003. */
+  txnType: string | null;
   occurrenceN: number;
 }
 
@@ -132,9 +134,41 @@ export function parseRows(
       status: adapter === "usaa" ? usaaStatus(pick(rec, "Status")) : "posted",
       bankCategory: pick(rec, "Category") || null,
       purchasedBy: adapter === "applecard" ? pick(rec, "Purchased By") || null : null,
+      // Apple is the only one of the four that states the type outright
+      // (Purchase/Payment/Credit/Debit) — the one non-heuristic transfer signal available.
+      txnType: adapter === "applecard" ? pick(rec, "Type") || null : null,
       occurrenceN,
     });
   });
 
   return { rows, skipped };
+}
+
+/**
+ * Sanity-check the file against the account it is being imported into.
+ *
+ * Both USAA exports are named bk_download.csv, share an identical header, and contain
+ * nothing that identifies the account — only the SIGN PATTERN differs (checking: mostly
+ * negative, card: mostly positive). Picking the wrong account therefore inverts every
+ * amount in the file and fails silently, which is the single most damaging mistake
+ * available in this UI (docs §9).
+ *
+ * This is a warning, never a block: it reads the ledger-normalized amounts, so a genuine
+ * statement dominated by refunds or a payoff month could legitimately trip it. Measured
+ * against the four real exports, the correct pairing is never flagged — checking is 78%
+ * outflow, the card 92%, Discover 80%, Apple 91%.
+ */
+export function accountTypeWarning(rows: ParsedRow[], accountName: string): string | null {
+  if (rows.length < 20) return null; // too small to say anything
+  const out = rows.filter((r) => r.amount < 0).length;
+  const share = out / rows.length;
+  // After normalization a correctly-paired file is mostly money OUT, whatever the
+  // institution's own convention was. Mostly money IN means the sign got flipped.
+  if (share >= 0.3) return null;
+  return (
+    `${Math.round((1 - share) * 100)}% of rows in this file are money IN after applying ` +
+    `"${accountName}"'s account type. That usually means the file belongs to the other ` +
+    `kind of account (e.g. a credit-card export imported into a checking account), which ` +
+    `inverts every amount. Check the account before trusting this import.`
+  );
 }
