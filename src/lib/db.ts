@@ -184,6 +184,13 @@ export interface SpendReport {
   unpaired_transfers: number;
   /** Sheet rows superseded by CSV coverage. The reconciliation backlog, counted. */
   superseded_sheet_rows: number;
+  /**
+   * Cashback and reward points. Excluded from BOTH spent and received (Will's call, doc
+   * §2g option A), so they would be invisible without their own figure — the point of
+   * giving them a category was to see them, not to hide them.
+   */
+  rewards: string;
+  reward_rows: number;
 }
 
 /**
@@ -217,6 +224,10 @@ export async function spendReport(): Promise<SpendReport> {
       (SELECT COUNT(*) FROM counted_transactions
         WHERE exclusion_reason = 'transfer' AND transfer_group_id IS NULL)::int
         AS unpaired_transfers,
+      (SELECT COALESCE(SUM(amount), 0) FROM counted_transactions
+        WHERE exclusion_reason = 'reward')::text AS rewards,
+      (SELECT COUNT(*) FROM counted_transactions
+        WHERE exclusion_reason = 'reward')::int AS reward_rows,
       -- The reconciliation backlog: sheet rows the CSVs supersede, i.e. exactly the rows
       -- the view leaves out. Counted from the base table on purpose — they are absent from
       -- the view by definition, so it cannot report on them.
@@ -226,7 +237,7 @@ export async function spendReport(): Promise<SpendReport> {
           AND t.txn_date >= (SELECT MIN(txn_date) FROM transactions
                              WHERE source = 'csv' AND merged_into_id IS NULL))::int
         AS superseded_sheet_rows
-  `) as { transfer_rows: number; unpaired_transfers: number; superseded_sheet_rows: number }[];
+  `) as Omit<SpendReport, "eras">[];
 
   return { eras, ...counts };
 }

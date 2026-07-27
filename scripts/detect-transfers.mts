@@ -10,6 +10,12 @@
  *      Venmo or Bonvenu — and Bonvenu has no CSV export, so it can never be imported.
  *      A pairing-only design would leave those still counted.
  *
+ *      ⚠️ AS OF MIGRATION 0009 A DATABASE TRIGGER DOES THIS, and it is the authoritative
+ *      path. This script's exclusion pass only ever backfills rows that predate the
+ *      trigger, and normally reports 0. The trigger exists because THIS SCRIPT WAS THE
+ *      ONLY THING APPLYING THE RULE: the import route never did, so each CSV upload
+ *      quietly landed new card payments as spending until someone re-ran this by hand.
+ *
  *   2. PAIR — where both legs ARE present (156 legs), link them into one transfer_group.
  *      Enrichment, not the mechanism for exclusion.
  *

@@ -219,3 +219,71 @@ test("counted_transactions keeps rows for accounts with no CSV export", async ()
   `) as { n: number }[];
   assert.equal(seen.n, 1, "a CSV-era row on a non-CSV account must still count");
 });
+
+/**
+ * The vendor-exclusion trigger (migration 0009).
+ *
+ * ⚠️ WHY IT EXISTS: exclusion used to be applied only by scripts/detect-transfers.mts, run
+ * by hand. The import route never applied it, so every CSV upload landed new card payments
+ * and cashback as spending and the totals drifted wrong until someone re-ran the script.
+ */
+async function mkTxnWithStore(storeName: string, amount: number) {
+  const [s] = (await sql`
+    SELECT id, kind::text AS kind FROM canonical_stores WHERE name = ${storeName}
+  `) as { id: string; kind: string }[];
+  assert.ok(s, `fixture vendor ${storeName} must exist`);
+  const r = (await sql`
+    INSERT INTO transactions (account_id, txn_date, raw_description, normalized_merchant,
+      amount, source, canonical_store_id, imported_txn_date, imported_amount, imported_description)
+    VALUES (${accountId}::uuid, '2026-07-17'::date, ${storeName}, ${storeName.toUpperCase()},
+            ${amount}, 'manual'::txn_source, ${s.id}::uuid, '2026-07-17'::date, ${amount}, ${storeName})
+    RETURNING id
+  `) as { id: string }[];
+  made.push(r[0].id);
+  return { txnId: r[0].id, storeId: s.id };
+}
+
+const exclusionOf = async (id: string) =>
+  ((await sql`
+    SELECT excluded_from_totals, exclusion_reason FROM transactions WHERE id = ${id}::uuid
+  `) as { excluded_from_totals: boolean; exclusion_reason: string | null }[])[0];
+
+test("a transfer vendor excludes its row on insert, with no script run", async () => {
+  const { txnId } = await mkTxnWithStore("USAA Credit Card Payment", -500);
+  assert.deepEqual(await exclusionOf(txnId),
+    { excluded_from_totals: true, exclusion_reason: "transfer" });
+});
+
+test("a reward vendor excludes its row on insert", async () => {
+  const { txnId } = await mkTxnWithStore("Cashback Bonus Redemption", 25);
+  assert.deepEqual(await exclusionOf(txnId),
+    { excluded_from_totals: true, exclusion_reason: "reward" });
+});
+
+test("repointing a row at an ordinary vendor returns it to the totals", async () => {
+  const { txnId } = await mkTxnWithStore("USAA Credit Card Payment", -500);
+  const [store] = (await sql`
+    SELECT id FROM canonical_stores WHERE kind = 'store' ORDER BY name LIMIT 1
+  `) as { id: string }[];
+
+  await applyEdits(txnId, { canonical_store_id: store.id }, "u");
+  assert.deepEqual(await exclusionOf(txnId),
+    { excluded_from_totals: false, exclusion_reason: null },
+    "a miscategorised transfer, once corrected, must count again");
+});
+
+test("a human exclusion outranks the trigger", async () => {
+  // Otherwise re-resolving a vendor silently undoes a deliberate choice.
+  const [ordinary] = (await sql`
+    SELECT id FROM canonical_stores WHERE kind = 'store' ORDER BY name LIMIT 1
+  `) as { id: string }[];
+  const t = await mkTxn({ amount: -80, date: "2026-07-17", desc: "hand excluded" });
+
+  await applyEdits(t.id, { excluded_from_totals: true }, "u");
+  assert.equal((await exclusionOf(t.id)).exclusion_reason, "manual");
+
+  await applyEdits(t.id, { canonical_store_id: ordinary.id }, "u");
+  assert.deepEqual(await exclusionOf(t.id),
+    { excluded_from_totals: true, exclusion_reason: "manual" },
+    "the trigger must not overwrite a manual decision");
+});

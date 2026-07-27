@@ -57,6 +57,13 @@ export default async function Home() {
             {report.transfer_rows.toLocaleString()} transfers excluded from spending
             {report.unpaired_transfers > 0 &&
               ` (${report.unpaired_transfers.toLocaleString()} to accounts outside this ledger)`}
+            {report.reward_rows > 0 && (
+              <>
+                {" · "}
+                {money(report.rewards)} cashback &amp; rewards
+                <span className="text-gray-400"> (counted as neither)</span>
+              </>
+            )}
           </p>
         </div>
         <UserButton />
