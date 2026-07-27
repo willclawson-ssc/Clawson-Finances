@@ -206,11 +206,27 @@ export async function applyEdits(
       : prevStr === nextStr;
     if (unchanged) { skipped.push(field); continue; }
 
-    // Field name is from the allowlist above, never from user input.
-    await sql.query(
-      `UPDATE transactions SET ${field} = $1 WHERE id = $2::uuid`,
-      [next, txnId],
-    );
+    // ⚠️ excluded_from_totals must carry its reason in the SAME statement. The database
+    // requires the flag and exclusion_reason to agree (migration 0007), and a CHECK
+    // constraint cannot be deferred in Postgres — setting the flag alone and fixing the
+    // reason afterwards fails on the first statement. A hand-exclusion is 'manual';
+    // clearing the flag clears the reason, so a row that was auto-excluded as a transfer
+    // and then re-excluded by hand correctly reads as a human decision.
+    if (field === "excluded_from_totals") {
+      await sql.query(
+        `UPDATE transactions
+         SET excluded_from_totals = $1,
+             exclusion_reason = CASE WHEN $1 THEN 'manual' ELSE NULL END
+         WHERE id = $2::uuid`,
+        [next, txnId],
+      );
+    } else {
+      // Field name is from the allowlist above, never from user input.
+      await sql.query(
+        `UPDATE transactions SET ${field} = $1 WHERE id = $2::uuid`,
+        [next, txnId],
+      );
+    }
     await sql`
       INSERT INTO transaction_edits (transaction_id, field, old_value, new_value, edited_by, note)
       VALUES (${txnId}::uuid, ${field}, ${prevStr}, ${nextStr}, ${editedBy}, ${note ?? null})
@@ -324,7 +340,9 @@ export async function mergeTransactions(
   await sql`UPDATE line_items SET transaction_id = ${survivorId}::uuid WHERE transaction_id = ${loserId}::uuid`;
 
   await sql`
-    UPDATE transactions SET merged_into_id = ${survivorId}::uuid, excluded_from_totals = true
+    UPDATE transactions
+    SET merged_into_id = ${survivorId}::uuid,
+        excluded_from_totals = true, exclusion_reason = 'duplicate'
     WHERE id = ${loserId}::uuid
   `;
 
@@ -348,7 +366,8 @@ export async function unmergeTransactions(mergeId: string): Promise<void> {
   const { survivor_id, merged_id, survivor_snapshot } = rows[0];
 
   await sql`
-    UPDATE transactions SET merged_into_id = NULL, excluded_from_totals = false
+    UPDATE transactions
+    SET merged_into_id = NULL, excluded_from_totals = false, exclusion_reason = NULL
     WHERE id = ${merged_id}::uuid
   `;
 

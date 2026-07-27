@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { auth } from "@clerk/nextjs/server";
 import { SignInButton, UserButton } from "@clerk/nextjs";
-import { accountSummaries, recentTransactions, listAccounts } from "@/lib/db";
+import { accountSummaries, recentTransactions, listAccounts, spendReport } from "@/lib/db";
 import { ImportPanel } from "./import-panel";
 
 export const dynamic = "force-dynamic";
@@ -28,38 +28,67 @@ export default async function Home() {
     );
   }
 
-  const [summaries, txns, accounts] = await Promise.all([
+  const [summaries, txns, accounts, report] = await Promise.all([
     accountSummaries(),
     recentTransactions(100),
     listAccounts(),
+    spendReport(),
   ]);
-
-  const net = summaries.reduce((a, s) => a + Number(s.balance ?? 0), 0);
 
   return (
     <main className="mx-auto max-w-6xl p-6">
       <header className="mb-8 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Clawson Finances</h1>
+          {/*
+            The word "spent" is finally allowed here, and transfer detection is what earned
+            it: the 768 rows whose vendor is a transfer (card payments, Marcus, Bonvenu,
+            Venmo, GuideStone) no longer count, so this is purchases rather than balance
+            movement.
+
+            But it is reported PER ERA, not as one figure, because the sheet and CSV
+            histories overlap and a combined total would read ~$564k against ~$181k of
+            real spending per era. Splitting is what makes each number true; a single
+            total with an apology attached would not be.
+          */}
           <p className="text-sm text-gray-500">
             {summaries.reduce((a, s) => a + s.txn_count, 0).toLocaleString()} transactions
-            {" · net change "}
-            {money(net)}
-          </p>
-          {/*
-            Deliberately "net change", never "spent". On a liability account this sum is
-            the balance change: card payments come in as inflows and largely cancel the
-            purchases (the real USAA card export nets +$1,598 over 18 months). A true
-            spend figure requires transfer detection, which isn't built yet — so labelling
-            this "spent" would be actively wrong.
-          */}
-          <p className="mt-1 text-xs text-amber-700">
-            Transfers between accounts aren&apos;t detected yet, so card payments still count
-            here. This is not a spending total.
+            {" · "}
+            {report.transfer_rows.toLocaleString()} transfers excluded from spending
+            {report.unpaired_transfers > 0 &&
+              ` (${report.unpaired_transfers.toLocaleString()} to accounts outside this ledger)`}
           </p>
         </div>
         <UserButton />
       </header>
+
+      <section className="mb-8">
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">
+          Spending
+        </h2>
+        <div className="grid gap-3 sm:grid-cols-2">
+          {report.eras.map((e) => (
+            <div key={e.era} className="rounded-lg border p-4">
+              <div className="text-xs uppercase tracking-wide text-gray-400">
+                {e.era === "sheet" ? "Google Sheet history" : "Bank CSV exports"}
+              </div>
+              <div className="mt-1 text-xl tabular-nums">{money(e.spent)} spent</div>
+              <div className="mt-1 text-sm tabular-nums text-gray-500">
+                {money(e.received)} received
+              </div>
+              <div className="mt-2 text-xs text-gray-500">
+                {e.from} → {e.to} · {e.txn_count.toLocaleString()} txns
+              </div>
+            </div>
+          ))}
+        </div>
+        {/* The backlog is stated as a number, not as a vague caveat. */}
+        <p className="mt-2 text-xs text-amber-700">
+          Split by era on purpose: {report.superseded_sheet_rows.toLocaleString()} sheet rows
+          inside the CSV period describe purchases the CSVs already cover, so counting both
+          would double them. They are excluded here until reconciliation merges them.
+        </p>
+      </section>
 
       <section className="mb-8">
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">
@@ -77,12 +106,22 @@ export default async function Home() {
                   <span className="font-medium">{s.name}</span>
                   <span className="text-xs uppercase text-gray-400">{s.type}</span>
                 </div>
-                <div className="mt-1 text-xl tabular-nums">{money(s.balance)}</div>
+                {/* "Net change", not "balance" — there is no opening balance to add it to.
+                    It counts transfers, because paying the card really does move money;
+                    the in/out line below deliberately does not. */}
+                <div className="mt-1 text-xl tabular-nums">{money(s.net_change)}</div>
+                <div className="text-xs text-gray-400">
+                  net change{s.covered_from && ` since ${s.covered_from}`}
+                </div>
+                <div className="mt-2 text-xs tabular-nums text-gray-500">
+                  {money(s.money_out)} out · {money(s.money_in)} in
+                  <span className="text-gray-400"> (excl. transfers)</span>
+                </div>
                 <div className="mt-1 text-xs text-gray-500">
                   {s.txn_count.toLocaleString()} txns
                   {/* Staleness is stated outright rather than implied. */}
                   {s.reconciled_through
-                    ? ` · reconciled through ${s.reconciled_through}`
+                    ? ` · through ${s.reconciled_through}`
                     : " · nothing imported yet"}
                 </div>
               </div>

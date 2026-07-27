@@ -117,27 +117,116 @@ export interface AccountSummary {
   institution: string;
   type: string;
   txn_count: number;
-  balance: string | null;
+  /** NOT a balance — see accountSummaries(). Net movement over the covered window. */
+  net_change: string | null;
+  money_in: string | null;
+  money_out: string | null;
+  covered_from: string | null;
   reconciled_through: string | null;
 }
 
 /**
- * Running balance is COMPUTED, never stored, and surfaced with the date it is complete
- * through. The ledger is complete as of the last import — staleness is uniform and
- * legible rather than partial in a hard-to-explain way.
+ * Per-account movement, surfaced with the window it covers.
+ *
+ * ⚠️ THIS IS NOT A BALANCE, AND THE FIELD USED TO CLAIM IT WAS. A balance needs an opening
+ * figure, and `accounts` has no opening_balance column: the CSVs start 2025-01-25 on
+ * accounts that already existed, so summing them gives the CHANGE over the export window,
+ * not what is in the account. It is named net_change accordingly. Real balances are an open
+ * item (docs §9) and need opening_balance + opening_balance_date per account.
+ *
+ * ⚠️ The sheet era's net change is structurally inflated for checking, and no arithmetic
+ * fixes it: the sheet was a BUDGET log, not a bank ledger. Its 'Credit Card Pmts' category
+ * has zero rows, so income was recorded while the card payments that consumed it never
+ * were. Money goes in and never comes out.
+ *
+ * ⚠️ NET CHANGE INCLUDES TRANSFERS; SPEND DOES NOT. Easy to get backwards — this query used
+ * to filter `NOT excluded_from_totals` for the total, harmless only because nothing was ever
+ * excluded. Once transfer detection ran it would have added $106k of card payments and
+ * savings transfers back in. Paying the card does move money (count it); it is not spending
+ * (don't count it in money_in/money_out).
+ *
+ * ⚠️ Sums come from counted_transactions, NOT transactions, or the sheet/CSV overlap
+ * double-counts and USAA Checking reports +$202,592 off 18 months counted twice.
+ * See db/migrations/0008.
  */
 export async function accountSummaries(): Promise<AccountSummary[]> {
   return (await sql`
     SELECT a.id, a.name, a.institution, a.type::text AS type,
            COUNT(t.id)::int AS txn_count,
-           COALESCE(SUM(t.amount), 0)::text AS balance,
+           MIN(t.txn_date)::text AS covered_from,
+           COALESCE(SUM(t.amount), 0)::text AS net_change,
+           COALESCE(SUM(t.amount) FILTER (
+             WHERE t.amount > 0 AND NOT t.excluded_from_totals), 0)::text AS money_in,
+           COALESCE(SUM(t.amount) FILTER (
+             WHERE t.amount < 0 AND NOT t.excluded_from_totals), 0)::text AS money_out,
            MAX(t.txn_date)::text AS reconciled_through
     FROM accounts a
-    LEFT JOIN transactions t
-      ON t.account_id = a.id AND NOT t.excluded_from_totals
-      AND t.merged_into_id IS NULL
+    LEFT JOIN counted_transactions t ON t.account_id = a.id
     WHERE a.active
     GROUP BY a.id, a.name, a.institution, a.type
     ORDER BY a.name
   `) as AccountSummary[];
+}
+
+export interface SpendEra {
+  era: "sheet" | "csv";
+  from: string;
+  to: string;
+  txn_count: number;
+  spent: string;
+  received: string;
+}
+
+export interface SpendReport {
+  eras: SpendEra[];
+  transfer_rows: number;
+  /** Transfers with only one leg in the ledger — excluded, but never paired. */
+  unpaired_transfers: number;
+  /** Sheet rows superseded by CSV coverage. The reconciliation backlog, counted. */
+  superseded_sheet_rows: number;
+}
+
+/**
+ * Spending — SPLIT BY ERA, and the split is the honest part.
+ *
+ * ⚠️ A SINGLE LEDGER-WIDE TOTAL IS STILL NOT SHOWABLE, even now that transfers are
+ * excluded. Summing raw `transactions` reports $564k spent against ~$181k of real spending
+ * per era, because the sheet and CSV histories overlap (docs §2e). Transfer detection fixed
+ * the transfers problem; it does not fix the duplication problem.
+ *
+ * The slicing rule lives in the counted_transactions view (db/migrations/0008), which also
+ * supplies the `era` label — deliberately in ONE place, because every future SUM needs the
+ * same rule and the next one written will otherwise forget it.
+ */
+export async function spendReport(): Promise<SpendReport> {
+  const eras = (await sql`
+    SELECT era, MIN(txn_date)::text AS from, MAX(txn_date)::text AS to,
+           COUNT(*)::int AS txn_count,
+           COALESCE(-SUM(amount) FILTER (
+             WHERE amount < 0 AND NOT excluded_from_totals), 0)::text AS spent,
+           COALESCE(SUM(amount) FILTER (
+             WHERE amount > 0 AND NOT excluded_from_totals), 0)::text AS received
+    FROM counted_transactions
+    GROUP BY era ORDER BY MIN(txn_date)
+  `) as SpendEra[];
+
+  const [counts] = (await sql`
+    SELECT
+      (SELECT COUNT(*) FROM counted_transactions
+        WHERE exclusion_reason = 'transfer')::int AS transfer_rows,
+      (SELECT COUNT(*) FROM counted_transactions
+        WHERE exclusion_reason = 'transfer' AND transfer_group_id IS NULL)::int
+        AS unpaired_transfers,
+      -- The reconciliation backlog: sheet rows the CSVs supersede, i.e. exactly the rows
+      -- the view leaves out. Counted from the base table on purpose — they are absent from
+      -- the view by definition, so it cannot report on them.
+      (SELECT COUNT(*) FROM transactions t
+         JOIN accounts a ON a.id = t.account_id
+        WHERE t.merged_into_id IS NULL AND t.source = 'sheet' AND a.supports_csv
+          AND t.txn_date >= (SELECT MIN(txn_date) FROM transactions
+                             WHERE source = 'csv' AND merged_into_id IS NULL))::int
+        AS superseded_sheet_rows
+  `) as { transfer_rows: number; unpaired_transfers: number; superseded_sheet_rows: number }[];
+
+  return { eras, ...counts };
 }

@@ -166,3 +166,56 @@ test("refuses nonsensical merges", async () => {
   await unmergeTransactions(mergeId);
   await assert.rejects(() => unmergeTransactions(mergeId), /already undone/);
 });
+
+/**
+ * The exclusion flag and its reason must always agree — migration 0007 enforces it with a
+ * CHECK, and a CHECK cannot be deferred in Postgres, so both columns have to move in one
+ * statement. This is not hypothetical: adding the constraint broke merge immediately,
+ * because merge excluded its loser without naming a reason.
+ */
+test("excluding a transaction by hand records the reason atomically", async () => {
+  const t = await mkTxn({ amount: -75, date: "2026-07-18", desc: "manual exclusion" });
+
+  await applyEdits(t.id, { excluded_from_totals: true }, "u");
+  const [on] = (await sql`
+    SELECT excluded_from_totals, exclusion_reason FROM transactions WHERE id = ${t.id}::uuid
+  `) as { excluded_from_totals: boolean; exclusion_reason: string | null }[];
+  assert.deepEqual(on, { excluded_from_totals: true, exclusion_reason: "manual" });
+
+  await applyEdits(t.id, { excluded_from_totals: false }, "u");
+  const [off] = (await sql`
+    SELECT excluded_from_totals, exclusion_reason FROM transactions WHERE id = ${t.id}::uuid
+  `) as { excluded_from_totals: boolean; exclusion_reason: string | null }[];
+  assert.deepEqual(off, { excluded_from_totals: false, exclusion_reason: null },
+    "clearing the flag must clear the reason, not orphan it");
+});
+
+test("merge marks its loser excluded as a duplicate", async () => {
+  const survivor = await mkTxn({ amount: -60, date: "2026-07-19", desc: "dup survivor" });
+  const loser = await mkTxn({ amount: -60, date: "2026-07-19", desc: "dup loser" });
+
+  const { mergeId } = await mergeTransactions(survivor.id, loser.id, "u");
+  const [merged] = (await sql`
+    SELECT excluded_from_totals, exclusion_reason FROM transactions WHERE id = ${loser.id}::uuid
+  `) as { excluded_from_totals: boolean; exclusion_reason: string | null }[];
+  assert.deepEqual(merged, { excluded_from_totals: true, exclusion_reason: "duplicate" });
+
+  await unmergeTransactions(mergeId);
+  const [undone] = (await sql`
+    SELECT excluded_from_totals, exclusion_reason FROM transactions WHERE id = ${loser.id}::uuid
+  `) as { excluded_from_totals: boolean; exclusion_reason: string | null }[];
+  assert.deepEqual(undone, { excluded_from_totals: false, exclusion_reason: null });
+});
+
+/**
+ * The whole point of counted_transactions: the scratch account has supports_csv = false, so
+ * its rows must survive the view's era filter regardless of date. This is the Dad's Checking
+ * case that a plain `source = 'csv'` filter silently dropped $3,720 of.
+ */
+test("counted_transactions keeps rows for accounts with no CSV export", async () => {
+  const t = await mkTxn({ amount: -42, date: "2026-07-23", desc: "no csv account row" });
+  const [seen] = (await sql`
+    SELECT count(*)::int AS n FROM counted_transactions WHERE id = ${t.id}::uuid
+  `) as { n: number }[];
+  assert.equal(seen.n, 1, "a CSV-era row on a non-CSV account must still count");
+});
