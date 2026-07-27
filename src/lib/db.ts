@@ -52,10 +52,27 @@ export async function listAccounts(): Promise<Account[]> {
   `) as Account[];
 }
 
+export interface NamedRow {
+  id: string;
+  name: string;
+}
+
+export async function listCategories(): Promise<NamedRow[]> {
+  return (await sql`SELECT id, name FROM categories WHERE active ORDER BY name`) as NamedRow[];
+}
+
+/** Canonical vendors, for the transaction detail page's store picker. */
+export async function listStores(): Promise<NamedRow[]> {
+  return (await sql`SELECT id, name FROM canonical_stores WHERE active ORDER BY name`) as NamedRow[];
+}
+
 export interface LedgerRow {
   id: string;
+  display_id: string;
   txn_date: string;
   normalized_merchant: string;
+  /** Canonical vendor name ("The Home Depot"), falling back to the normalized string. */
+  store_name: string | null;
   raw_description: string;
   amount: string;
   status: string;
@@ -79,12 +96,16 @@ export interface LedgerRow {
  */
 export async function recentTransactions(limit = 100): Promise<LedgerRow[]> {
   return (await sql`
-    SELECT t.id, t.txn_date::text AS txn_date, t.normalized_merchant, t.raw_description,
+    SELECT t.id, t.display_id, t.txn_date::text AS txn_date, t.normalized_merchant,
+           s.name AS store_name, t.raw_description,
            t.amount, t.status, t.source,
            a.name AS account_name, c.name AS category_name
     FROM transactions t
     JOIN accounts a ON a.id = t.account_id
     LEFT JOIN categories c ON c.id = t.category_id
+    LEFT JOIN canonical_stores s ON s.id = t.canonical_store_id
+    -- Merged duplicates keep their row and their id, but never appear in the ledger.
+    WHERE t.merged_into_id IS NULL
     ORDER BY t.txn_date DESC, t.created_at DESC
     LIMIT ${limit}
   `) as LedgerRow[];
@@ -114,6 +135,7 @@ export async function accountSummaries(): Promise<AccountSummary[]> {
     FROM accounts a
     LEFT JOIN transactions t
       ON t.account_id = a.id AND NOT t.excluded_from_totals
+      AND t.merged_into_id IS NULL
     WHERE a.active
     GROUP BY a.id, a.name, a.institution, a.type
     ORDER BY a.name

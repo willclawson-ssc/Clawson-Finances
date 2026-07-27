@@ -6,6 +6,7 @@ import {
   detectAdapter, parseRows, accountTypeWarning, type AccountType, type AdapterId,
 } from "@/lib/adapters";
 import { matchSettlements, type ExistingPending } from "@/lib/reconcile";
+import { buildStoreIndex, resolveStore, type StoreAlias } from "@/lib/stores";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -61,6 +62,19 @@ export async function POST(req: Request) {
   `) as ExistingPending[];
   const { settlements, fresh } = matchSettlements(rows, pending);
 
+  // Resolve each descriptor to a canonical vendor by longest match, so "THE HOME DEPOT
+  // 1234 SOMEWHERE" lands on The Home Depot without any stripping rule having to guess
+  // which trailing digits belong to the brand. Unresolved rows are a genuinely new
+  // vendor and are reported, not silently left blank.
+  const aliases = (await sql`
+    SELECT pattern, store_id AS "storeId" FROM store_aliases
+  `) as StoreAlias[];
+  const storeIdx = buildStoreIndex(aliases);
+  const storeIds = fresh.map((r) => resolveStore(r.normalizedMerchant, storeIdx));
+  const unresolved = [
+    ...new Set(fresh.filter((_, i) => !storeIds[i]).map((r) => r.normalizedMerchant)),
+  ];
+
   const importRows = (await sql`
     INSERT INTO statement_imports (account_id, adapter, filename, row_count, range_start, range_end)
     VALUES (${accountId}::uuid, ${adapter}, ${file.name}, ${rows.length},
@@ -100,19 +114,21 @@ export async function POST(req: Request) {
   const CHUNK = 500;
   for (let i = 0; i < fresh.length; i += CHUNK) {
     const chunk = fresh.slice(i, i + CHUNK);
+    const chunkStores = storeIds.slice(i, i + CHUNK);
     const result = (await sql.query(
       `INSERT INTO transactions
          (account_id, txn_date, post_date, raw_description, normalized_merchant,
           amount, status, source, bank_category, purchased_by, txn_type, occurrence_n,
-          statement_import_id)
+          canonical_store_id, statement_import_id)
        SELECT $1::uuid, d.txn_date, d.post_date, d.raw_description, d.normalized_merchant,
               d.amount, d.status::txn_status, 'csv'::txn_source, d.bank_category,
-              d.purchased_by, d.txn_type, d.occurrence_n, $2::uuid
+              d.purchased_by, d.txn_type, d.occurrence_n, d.store_id::uuid, $2::uuid
        FROM unnest(
               $3::date[], $4::date[], $5::text[], $6::text[], $7::numeric[],
-              $8::text[], $9::text[], $10::text[], $11::text[], $12::smallint[]
+              $8::text[], $9::text[], $10::text[], $11::text[], $12::smallint[],
+              $13::text[]
             ) AS d(txn_date, post_date, raw_description, normalized_merchant, amount,
-                   status, bank_category, purchased_by, txn_type, occurrence_n)
+                   status, bank_category, purchased_by, txn_type, occurrence_n, store_id)
        ON CONFLICT (fingerprint) WHERE source = 'csv' DO NOTHING
        RETURNING 1`,
       [
@@ -128,6 +144,7 @@ export async function POST(req: Request) {
         chunk.map((r) => r.purchasedBy),
         chunk.map((r) => r.txnType),
         chunk.map((r) => r.occurrenceN),
+        chunkStores,
       ],
     )) as unknown[];
     inserted += Array.isArray(result) ? result.length : 0;
@@ -147,6 +164,7 @@ export async function POST(req: Request) {
     parsed: rows.length,
     settled,
     warning,
+    newVendors: unresolved,
     inserted,
     duplicates,
     unparseable: skipped.length,

@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { auth } from "@clerk/nextjs/server";
 import { SignInButton, UserButton } from "@clerk/nextjs";
 import { accountSummaries, recentTransactions, listAccounts } from "@/lib/db";
@@ -105,6 +106,7 @@ export default async function Home() {
             <table className="w-full text-sm">
               <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
                 <tr>
+                  <th className="p-2.5">ID</th>
                   <th className="p-2.5">Date</th>
                   <th className="p-2.5">Merchant</th>
                   <th className="p-2.5">Account</th>
@@ -114,13 +116,20 @@ export default async function Home() {
               </thead>
               <tbody>
                 {txns.map((t) => (
-                  <tr key={t.id} className="border-t">
+                  <tr key={t.id} className="border-t hover:bg-gray-50">
+                    <td className="whitespace-nowrap p-2.5">
+                      <Link href={`/transactions/${t.display_id}`}
+                        className="font-mono text-xs text-blue-700 hover:underline">
+                        {t.display_id}
+                      </Link>
+                    </td>
                     <td className="whitespace-nowrap p-2.5 tabular-nums text-gray-600">
                       {t.txn_date}
                     </td>
                     <td className="p-2.5">
-                      {/* Hover reveals the raw descriptor the normalized name came from. */}
-                      <span title={t.raw_description}>{t.normalized_merchant}</span>
+                      {/* Canonical vendor name, falling back to the normalized string.
+                          Hover reveals the raw descriptor it was resolved from. */}
+                      <span title={t.raw_description}>{t.store_name ?? t.normalized_merchant}</span>
                       {t.status !== "posted" && (
                         <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800">
                           {t.status}
